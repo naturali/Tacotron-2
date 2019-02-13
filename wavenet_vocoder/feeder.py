@@ -156,11 +156,11 @@ class Feeder:
 
 	def start_threads(self, session):
 		self._session = session
-		thread = threading.Thread(name='background', target=self._enqueue_next_train_group)
+		thread = threading.Thread(name='background', target=self._enqueue_next_train_group_2)
 		thread.daemon = True #Thread will close when parent quits
 		thread.start()
 
-		thread = threading.Thread(name='background', target=self._enqueue_next_test_group)
+		thread = threading.Thread(name='background', target=self._enqueue_next_test_group_2)
 		thread.daemon = True #Thread will close when parent quits
 		thread.start()
 
@@ -222,11 +222,54 @@ class Feeder:
 				feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch)))
 				self._session.run(self._enqueue_op, feed_dict=feed_dict)
 
+	def _enqueue_next_train_group_2(self):
+		'''
+		20190213:
+		  Sample more segments from one example instead of only randomly selecting one to speed up training.
+		'''
+		while not self._coord.should_stop():
+			start = time.time()
+
+			# Read a group of examples
+			n = self._hparams.wavenet_batch_size
+			examples = [self._get_next_example() for i in range(n * _batches_per_group)]
+
+			# prepare batch (each example will produce multiple training segments)
+			new_batches = self._prepare_batch_2(examples)
+
+			# Bucket examples base on similiar output length for efficiency
+			indices = [(idx, l) for (idx, l) in enumerate(new_batches[2])]
+			indices.sort(key=lambda x:x[1])
+			item_num = len(new_batches)
+			batches = []
+			for i in range(0, len(indices), n):
+				mini_batch = []
+				for item in range(item_num):
+					mini_batch.append([new_batches[item][idx] for idx, _ in indices[i: i+n]])
+				batches.append(mini_batch)
+			np.random.shuffle(batches)
+
+			log('\nGenerated {} train batches of size {} in {:.3f} sec'.format(len(batches), n, time.time() - start))
+			for batch in batches:
+				feed_dict = dict(zip(self._placeholders, batch))
+				self._session.run(self._enqueue_op, feed_dict=feed_dict)
+
 	def _enqueue_next_test_group(self):
 		test_batches = self.make_test_batches()
 		while not self._coord.should_stop():
 			for batch in test_batches:
 				feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch)))
+				self._session.run(self._eval_enqueue_op, feed_dict=feed_dict)
+
+	def _enqueue_next_test_group_2(self):
+		'''
+		20190213:
+		  Set the max time step to `max_step` * `batch_size`.
+		'''
+		test_batches = self.make_test_batches()
+		while not self._coord.should_stop():
+			for batch in test_batches:
+				feed_dict = dict(zip(self._placeholders, self._prepare_batch_2(batch, test_mode=True)))
 				self._session.run(self._eval_enqueue_op, feed_dict=feed_dict)
 
 	def _get_next_example(self):
@@ -272,6 +315,39 @@ class Feeder:
 		max_time_steps = self._limit_time()
 		#Adjust time resolution for upsampling
 		batches = self._adjust_time_resolution(batches, self.local_condition, max_time_steps)
+
+		#time lengths
+		input_lengths = np.asarray([len(x[0]) for x in batches], np.int32)
+		max_input_length = max(input_lengths)
+
+		#Since all inputs/targets will have the same lengths for all GPUs, we can simply treat all GPUs batches as one big batch and stack all data. (fixed length)
+		inputs = self._prepare_inputs([x[0] for x in batches], max_input_length)
+		targets = self._prepare_targets([x[0] for x in batches], max_input_length)
+		local_condition_features = self._prepare_local_conditions(self.local_condition, [x[1] for x in batches])
+		global_condition_features = self._prepare_global_conditions(self.global_condition, [x[2] for x in batches])
+
+		#Create final batches
+		new_batches = (inputs, targets, input_lengths)
+		if local_condition_features is not None:
+			new_batches += (local_condition_features, )
+		if global_condition_features is not None:
+			new_batches += (global_condition_features, )
+
+		return new_batches
+
+	def _prepare_batch_2(self, batches, test_mode=False):
+		'''
+		20190213:
+		  Sample more segments from one example instead of only randomly selecting one to speed up training.
+		'''
+		assert 0 == len(batches) % self._hparams.wavenet_num_gpus
+		size_per_device = int(len(batches) / self._hparams.wavenet_num_gpus)
+		np.random.shuffle(batches)
+
+		#Limit time steps to save GPU Memory usage, when testing, max steps can be set to `limit_time` * `batch_size`
+		max_time_steps = self._limit_time() if not test_mode else self._limit_time() * self._hparams.wavenet_batch_size
+		#Adjust time resolution for upsampling
+		batches = self._adjust_time_resolution_2(batches, self.local_condition, max_time_steps)
 
 		#time lengths
 		input_lengths = np.asarray([len(x[0]) for x in batches], np.int32)
@@ -384,6 +460,54 @@ class Feeder:
 						self._assert_ready_for_upsample(x, c)
 
 				new_batch.append((x, c, g, l))
+			return new_batch
+
+		else:
+			new_batch = []
+			for b in batch:
+				x, c, g, l = b
+				x = audio.trim_silence(x, hparams)
+				if max_time_steps is not None and len(x) > max_time_steps:
+					start = np.random.randint(0, len(c) - max_time_steps)
+					x = x[start: start + max_time_steps]
+				new_batch.append((x, c, g, l))
+			return new_batch
+
+	def _adjust_time_resolution_2(self, batch, local_condition, max_time_steps):
+		'''
+		Adjust time resolution between audio and local condition
+		
+		20190213:
+		  Sample more segments from one example instead of only randomly selecting one to speed up training.
+		'''
+		if local_condition:
+			new_batch = []
+			for b in batch:
+				x, c, g, l = b
+				self._assert_ready_for_upsample(x, c)
+				new_batch_mini = []
+				if max_time_steps is not None:
+					max_steps = _ensure_divisible(max_time_steps, audio.get_hop_size(self._hparams), True)
+					if len(x) > max_time_steps:
+						max_time_frames = max_steps // audio.get_hop_size(self._hparams)
+						select_stride = max_time_frames // 2
+						max_sample_num = 5 # Max sampling number after randomly select the start position
+						start = np.random.randint(0, len(c) - max_time_frames)
+						
+						sample_num = 0
+						start_i = start
+						while sample_num < max_sample_num and start_i < (len(c) - max_time_frames):
+							time_start = start_i * audio.get_hop_size(self._hparams)
+							x_i = x[time_start: time_start + max_time_frames * audio.get_hop_size(self._hparams)]
+							c_i = c[start_i: start_i + max_time_frames, :]
+							self._assert_ready_for_upsample(x_i, c_i)
+							new_batch_mini.append((x_i, c_i, g, l))
+							sample_num += 1
+							start_i += select_stride
+				if new_batch_mini:
+					new_batch.extend(new_batch_mini)
+				else:
+					new_batch.append((x, c, g, l))
 			return new_batch
 
 		else:
