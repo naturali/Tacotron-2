@@ -264,8 +264,11 @@ class Feeder:
 
 
 	def _prepare_batch(self, batches, test_mode=False):
-		assert 0 == len(batches) % self._hparams.wavenet_num_gpus
-		size_per_device = int(len(batches) / self._hparams.wavenet_num_gpus)
+		if not test_mode:
+			assert 0 == len(batches) % self._hparams.wavenet_num_gpus
+			size_per_device = int(len(batches) / self._hparams.wavenet_num_gpus)
+		else:
+			size_per_device = len(batches)
 		np.random.shuffle(batches)
 
 		#Limit time steps to save GPU Memory usage
