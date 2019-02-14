@@ -226,7 +226,7 @@ class Feeder:
 		test_batches = self.make_test_batches()
 		while not self._coord.should_stop():
 			for batch in test_batches:
-				feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch)))
+				feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, test_mode=True)))
 				self._session.run(self._eval_enqueue_op, feed_dict=feed_dict)
 
 	def _get_next_example(self):
@@ -263,13 +263,13 @@ class Feeder:
 		return (input_data, local_condition_features, global_condition_features, len(input_data))
 
 
-	def _prepare_batch(self, batches):
+	def _prepare_batch(self, batches, test_mode=False):
 		assert 0 == len(batches) % self._hparams.wavenet_num_gpus
 		size_per_device = int(len(batches) / self._hparams.wavenet_num_gpus)
 		np.random.shuffle(batches)
 
 		#Limit time steps to save GPU Memory usage
-		max_time_steps = self._limit_time()
+		max_time_steps = self._limit_time() if not test_mode else self._limit_time() * self._hparams.wavenet_batch_size
 		#Adjust time resolution for upsampling
 		batches = self._adjust_time_resolution(batches, self.local_condition, max_time_steps)
 
