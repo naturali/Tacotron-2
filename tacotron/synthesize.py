@@ -22,7 +22,8 @@ def run_live(args, checkpoint_path, hparams):
 	synth.load(checkpoint_path, hparams)
 
 	#Generate fast greeting message
-	greetings = 'Hello, Welcome to the Live testing tool. Please type a message and I will try to read it!'
+	#greetings = 'Hello, Welcome to the Live testing tool. Please type a message and I will try to read it!'
+	greetings = 'ni3 hao3'
 	log(greetings)
 	generate_fast(synth, greetings)
 
