@@ -89,3 +89,9 @@ def english_cleaners(text):
   text = expand_abbreviations(text)
   text = collapse_whitespace(text)
   return text
+
+def pinyin_cleaners(text):
+  '''Pipeline for Chinese pinyin text.'''
+  text = convert_to_ascii(text)
+  text = collapse_whitespace(text)
+  return text
